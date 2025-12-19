@@ -62,18 +62,28 @@ def queue_prompt(prompt: dict, client_id: str):
 
 
 def get_images(ws, prompt_id):
-    images = {}
+    # ждём КОНЕЦ ГРАФА
     while True:
         msg = ws.recv()
         if isinstance(msg, str):
             data = json.loads(msg)
-            if data.get("type") == "executed" and data["data"]["prompt_id"] == prompt_id:
-                for node_id, node_data in data["data"]["output"].items():
-                    if "images" in node_data:
-                        images[node_id] = []
-                        for img in node_data["images"]:
-                            images[node_id].append(load_image(img))
-                return images
+            if data.get("type") == "executing":
+                if data["data"]["node"] is None and data["data"]["prompt_id"] == prompt_id:
+                    break
+
+    # теперь history гарантированно готов
+    with urllib.request.urlopen(f"{COMFY_HTTP}/history/{prompt_id}") as resp:
+        history = json.loads(resp.read())[prompt_id]
+
+    images = {}
+    for node_id, node_data in history["outputs"].items():
+        if "images" in node_data:
+            images[node_id] = []
+            for img in node_data["images"]:
+                images[node_id].append(load_image(img))
+
+    return images
+
 
 
 def load_image(img_info):
