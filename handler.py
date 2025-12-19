@@ -2,13 +2,11 @@ import runpod
 import websocket
 import uuid
 import json
-import os
 import base64
 import logging
 import urllib.request
 import urllib.parse
 import binascii
-import time
 
 # ================== CONFIG ==================
 
@@ -23,7 +21,6 @@ logger = logging.getLogger(__name__)
 # ================== COMFY HELPERS ==================
 
 def upload_image(name: str, image_b64: str):
-    """Upload image to ComfyUI"""
     try:
         image_bytes = base64.b64decode(image_b64)
     except binascii.Error:
@@ -61,8 +58,16 @@ def queue_prompt(prompt: dict, client_id: str):
         return json.loads(resp.read())
 
 
-def get_images(ws, prompt_id):
-    # ждём КОНЕЦ ГРАФА
+def load_image(img_info):
+    params = urllib.parse.urlencode(img_info)
+    with urllib.request.urlopen(f"{COMFY_HTTP}/view?{params}") as resp:
+        return base64.b64encode(resp.read()).decode("utf-8")
+
+
+def wait_and_get_history(ws, prompt_id):
+    """
+    Ждём полного завершения графа и возвращаем history
+    """
     while True:
         msg = ws.recv()
         if isinstance(msg, str):
@@ -71,25 +76,50 @@ def get_images(ws, prompt_id):
                 if data["data"]["node"] is None and data["data"]["prompt_id"] == prompt_id:
                     break
 
-    # теперь history гарантированно готов
     with urllib.request.urlopen(f"{COMFY_HTTP}/history/{prompt_id}") as resp:
-        history = json.loads(resp.read())[prompt_id]
-
-    images = {}
-    for node_id, node_data in history["outputs"].items():
-        if "images" in node_data:
-            images[node_id] = []
-            for img in node_data["images"]:
-                images[node_id].append(load_image(img))
-
-    return images
+        return json.loads(resp.read())[prompt_id]
 
 
+# ================== FINAL IMAGE SELECTOR ==================
 
-def load_image(img_info):
-    params = urllib.parse.urlencode(img_info)
-    with urllib.request.urlopen(f"{COMFY_HTTP}/view?{params}") as resp:
-        return base64.b64encode(resp.read()).decode("utf-8")
+def extract_final_image(history: dict) -> str:
+    """
+    Строго возвращает ТОЛЬКО финальное изображение:
+    приоритет:
+      1. PreviewImage
+      2. SaveImage
+      3. VAEDecode
+    """
+
+    outputs = history.get("outputs", {})
+    nodes = history.get("prompt", {})
+
+    # 1️⃣ PreviewImage
+    for node_id, node in nodes.items():
+        if node.get("class_type") == "PreviewImage":
+            images = outputs.get(node_id, {}).get("images", [])
+            if images:
+                logger.info(f"Returning PreviewImage from node {node_id}")
+                return load_image(images[0])
+
+    # 2️⃣ SaveImage
+    for node_id, node in nodes.items():
+        if node.get("class_type") == "SaveImage":
+            images = outputs.get(node_id, {}).get("images", [])
+            if images:
+                logger.info(f"Returning SaveImage from node {node_id}")
+                return load_image(images[0])
+
+    # 3️⃣ VAEDecode (fallback)
+    for node_id, node in nodes.items():
+        if node.get("class_type") == "VAEDecode":
+            images = outputs.get(node_id, {}).get("images", [])
+            if images:
+                logger.info(f"Returning VAEDecode output from node {node_id}")
+                return load_image(images[0])
+
+    raise RuntimeError("Final image not found in history")
+
 
 # ================== HANDLER ==================
 
@@ -97,51 +127,48 @@ def handler(event):
     """
     Expected input:
     {
-        "workflow": {...},        # full ComfyUI graph
+        "workflow": {...},
         "images": {
             "image.png": "base64..."
         }
     }
     """
 
-    try:
-        workflow = event["input"]["workflow"]
-    except KeyError:
-        return {"error": "Missing 'workflow' in input"}
+    if "input" not in event or "workflow" not in event["input"]:
+        return {"error": "Missing workflow in input"}
 
+    workflow = event["input"]["workflow"]
     images = event["input"].get("images", {})
 
-    # Upload images
+    # Upload input images
     for name, img_b64 in images.items():
         logger.info(f"Uploading image: {name}")
         upload_image(name, img_b64)
 
-    # WebSocket session
+    # WebSocket
     client_id = str(uuid.uuid4())
     ws = websocket.WebSocket()
     ws.connect(f"{COMFY_WS}?clientId={client_id}")
 
-    # Send workflow
+    # Queue prompt
     result = queue_prompt(workflow, client_id)
     prompt_id = result["prompt_id"]
-
     logger.info(f"Prompt queued: {prompt_id}")
 
-    images_out = get_images(ws, prompt_id)
+    # Wait & fetch history
+    history = wait_and_get_history(ws, prompt_id)
     ws.close()
 
-    if not images_out:
-        return {"error": "No images generated"}
+    try:
+        final_image_b64 = extract_final_image(history)
+    except Exception as e:
+        logger.error(str(e))
+        return {"error": "Failed to extract final image"}
 
-    # Return FIRST image (standard for RunPod)
-    for node_id in images_out:
-        if images_out[node_id]:
-            return {
-                "image": images_out[node_id][0],
-                "node_id": node_id,
-            }
+    return {
+        "image": final_image_b64
+    }
 
-    return {"error": "Images not found"}
 
 # ================== START ==================
 
