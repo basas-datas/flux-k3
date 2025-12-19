@@ -65,9 +65,6 @@ def load_image(img_info):
 
 
 def wait_and_get_history(ws, prompt_id):
-    """
-    Ждём полного завершения графа и возвращаем history
-    """
     while True:
         msg = ws.recv()
         if isinstance(msg, str):
@@ -80,82 +77,56 @@ def wait_and_get_history(ws, prompt_id):
         return json.loads(resp.read())[prompt_id]
 
 
-# ================== FINAL IMAGE SELECTOR ==================
+# ================== FINAL IMAGE EXTRACTOR ==================
 
 def extract_final_image(history: dict) -> str:
     """
-    Строго возвращает ТОЛЬКО финальное изображение:
-    приоритет:
-      1. PreviewImage
-      2. SaveImage
-      3. VAEDecode
+    Возвращает ПОСЛЕДНЕЕ реально сгенерированное изображение.
+    Работает стабильно во всех версиях ComfyUI.
     """
 
     outputs = history.get("outputs", {})
-    nodes = history.get("prompt", {})
 
-    # 1️⃣ PreviewImage
-    for node_id, node in nodes.items():
-        if node.get("class_type") == "PreviewImage":
-            images = outputs.get(node_id, {}).get("images", [])
-            if images:
-                logger.info(f"Returning PreviewImage from node {node_id}")
-                return load_image(images[0])
+    if not outputs:
+        raise RuntimeError("No outputs in history")
 
-    # 2️⃣ SaveImage
-    for node_id, node in nodes.items():
-        if node.get("class_type") == "SaveImage":
-            images = outputs.get(node_id, {}).get("images", [])
-            if images:
-                logger.info(f"Returning SaveImage from node {node_id}")
-                return load_image(images[0])
+    last_image = None
 
-    # 3️⃣ VAEDecode (fallback)
-    for node_id, node in nodes.items():
-        if node.get("class_type") == "VAEDecode":
-            images = outputs.get(node_id, {}).get("images", [])
-            if images:
-                logger.info(f"Returning VAEDecode output from node {node_id}")
-                return load_image(images[0])
+    # ВАЖНО: порядок dict в Python 3.7+ сохраняется
+    for node_id in outputs:
+        node_output = outputs[node_id]
+        images = node_output.get("images")
+        if images:
+            last_image = images[-1]
 
-    raise RuntimeError("Final image not found in history")
+    if not last_image:
+        raise RuntimeError("No images found in outputs")
+
+    logger.info("Returning FINAL processed image")
+    return load_image(last_image)
 
 
 # ================== HANDLER ==================
 
 def handler(event):
-    """
-    Expected input:
-    {
-        "workflow": {...},
-        "images": {
-            "image.png": "base64..."
-        }
-    }
-    """
-
     if "input" not in event or "workflow" not in event["input"]:
         return {"error": "Missing workflow in input"}
 
     workflow = event["input"]["workflow"]
     images = event["input"].get("images", {})
 
-    # Upload input images
     for name, img_b64 in images.items():
         logger.info(f"Uploading image: {name}")
         upload_image(name, img_b64)
 
-    # WebSocket
     client_id = str(uuid.uuid4())
     ws = websocket.WebSocket()
     ws.connect(f"{COMFY_WS}?clientId={client_id}")
 
-    # Queue prompt
     result = queue_prompt(workflow, client_id)
     prompt_id = result["prompt_id"]
     logger.info(f"Prompt queued: {prompt_id}")
 
-    # Wait & fetch history
     history = wait_and_get_history(ws, prompt_id)
     ws.close()
 
